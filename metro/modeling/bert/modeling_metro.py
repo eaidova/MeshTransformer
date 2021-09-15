@@ -218,6 +218,7 @@ class METRO_Hand_Network(torch.nn.Module):
         else:
             return cam_param, pred_3d_joints, pred_vertices_sub, pred_vertices
 
+
 class METRO_Body_Network(torch.nn.Module):
     '''
     End-to-end METRO network for human pose and mesh reconstruction from a single image.
@@ -305,4 +306,96 @@ class METRO_Body_Network(torch.nn.Module):
         if self.config.output_attentions==True:
             return cam_param, pred_3d_joints, pred_vertices_sub2, pred_vertices_sub, pred_vertices_full, hidden_states, att
         else:
-            return cam_param, pred_3d_joints, pred_vertices_sub2, pred_vertices_sub, pred_vertices_full 
+            return cam_param, pred_3d_joints, pred_vertices_sub2, pred_vertices_sub, pred_vertices_full
+
+
+class METRO_Body_Network_ONNX(torch.nn.Module):
+    '''
+    End-to-end METRO network for human pose and mesh reconstruction from a single image.
+    '''
+    def __init__(self, args, config, backbone, trans_encoder, mesh_sampler, smpl):
+        super(METRO_Body_Network_ONNX, self).__init__()
+        self.config = config
+        self.config.device = args.device
+        self.backbone = backbone
+        self.trans_encoder = trans_encoder
+        self.upsampling = torch.nn.Linear(431, 1723)
+        self.upsampling2 = torch.nn.Linear(1723, 6890)
+        self.conv_learn_tokens = torch.nn.Conv1d(49,431+14,1)
+        self.cam_param_fc = torch.nn.Linear(3, 1)
+        self.cam_param_fc2 = torch.nn.Linear(431, 250)
+        self.cam_param_fc3 = torch.nn.Linear(250, 3)
+        self.mesh_sampler = mesh_sampler
+        self.smpl = smpl
+        # Generate T-pose template mesh
+        template_pose = torch.zeros((1, 72))
+        template_pose[:, 0] = 3.1416  # Rectify "upside down" reference mesh in global coord
+        template_pose = template_pose.cuda(self.config.device)
+        template_betas = torch.zeros((1, 10)).cuda(self.config.device)
+        template_vertices = self.smpl(template_pose, template_betas)
+
+        # template mesh simplification
+        template_vertices_sub = self.mesh_sampler.downsample(template_vertices)
+        template_vertices_sub2 = self.mesh_sampler.downsample(template_vertices_sub, n1=1, n2=2)
+
+        # template mesh-to-joint regression
+        template_3d_joints = self.smpl.get_h36m_joints(template_vertices)
+        template_pelvis = template_3d_joints[:,cfg.H36M_J17_NAME.index('Pelvis'),:]
+        template_3d_joints = template_3d_joints[:,cfg.H36M_J17_TO_J14,:]
+        self.num_joints = int(template_3d_joints.shape[1])
+
+        # normalize
+        template_3d_joints = template_3d_joints - template_pelvis[:, None, :]
+        template_vertices_sub2 = template_vertices_sub2 - template_pelvis[:, None, :]
+        self.ref_vertices = torch.cat([template_3d_joints, template_vertices_sub2], dim=1)
+
+    def forward(self, images, meta_masks=None, is_train=False):
+        batch_size = images.size(0)
+
+        # concatinate template joints and template vertices, and then duplicate to batch size
+        ref_vertices = self.ref_vertices.expand(batch_size, -1, -1)
+
+        # extract image feature maps using a CNN backbone
+        image_feat = self.backbone(images)
+        image_feat_newview = image_feat.view(batch_size,2048,-1)
+        image_feat_newview = image_feat_newview.transpose(1,2)
+        # and apply a conv layer to learn image token for each 3d joint/vertex position
+        img_tokens = self.conv_learn_tokens(image_feat_newview)
+
+        # concatinate image feat and template mesh
+        features = torch.cat([ref_vertices, img_tokens], dim=2)
+
+        if is_train:
+            # apply mask vertex/joint modeling
+            # meta_masks is a tensor of all the masks, randomly generated in dataloader
+            # we pre-define a [MASK] token, which is a floating-value vector with 0.01s
+            constant_tensor = torch.ones_like(features).cuda(self.config.device)*0.01
+            features = features*meta_masks + constant_tensor*(1-meta_masks)
+
+        # forward pass
+        if self.config.output_attentions:
+            features, hidden_states, att = self.trans_encoder(features)
+        else:
+            features = self.trans_encoder(features)
+
+        pred_3d_joints = features[:,:self.num_joints,:]
+        pred_vertices_sub2 = features[:,self.num_joints:,:]
+
+        # learn camera parameters
+        x = self.cam_param_fc(pred_vertices_sub2)
+        x = x.transpose(1,2)
+        x = self.cam_param_fc2(x)
+        x = self.cam_param_fc3(x)
+        cam_param = x.transpose(1,2)
+        cam_param = cam_param.squeeze()
+
+        temp_transpose = pred_vertices_sub2.transpose(1,2)
+        pred_vertices_sub = self.upsampling(temp_transpose)
+        pred_vertices_full = self.upsampling2(pred_vertices_sub)
+        pred_vertices_sub = pred_vertices_sub.transpose(1,2)
+        pred_vertices_full = pred_vertices_full.transpose(1,2)
+
+        if self.config.output_attentions:
+            return cam_param, pred_3d_joints, pred_vertices_sub2, pred_vertices_sub, pred_vertices_full, hidden_states, att
+        else:
+            return cam_param, pred_3d_joints, pred_vertices_sub2, pred_vertices_sub, pred_vertices_full
